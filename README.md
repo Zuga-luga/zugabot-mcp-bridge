@@ -14,7 +14,13 @@ Claude Code ──stdio MCP──► zugabot_mcp_bridge.py ──HTTPS A2A──
 
 1. Your `client_id` (e.g. `friend-pc`)
 2. Your `client_secret`
-3. The Zugabot URL (default `https://zugabot.ai` — override if self-hosted)
+3. The operator's Zugabot A2A URL — **not** `https://zugabot.ai`. Verified
+   2026-07-19: that URL is the ZugaApp product frontend, not the Zugabot
+   agent's A2A endpoint — it 200s with an HTML page, and the bridge (or
+   this README's own smoke test) fails with a JSON error against it. The
+   agent's `/a2a` + `/.well-known/agent.json` only exist wherever the
+   operator's Zugabot daemon actually runs (e.g. a LAN IP:port) — ask them
+   for that, not the public product URL.
 
 Keep the secret out of git. Store in your OS keychain or a local `.env`.
 
@@ -40,25 +46,32 @@ Set two environment variables:
 ```bash
 # Linux/macOS
 export ZUGABOT_A2A_TOKEN="friend-pc:<your-secret>"
-export ZUGABOT_A2A_URL="https://zugabot.ai"  # optional, this is the default
+export ZUGABOT_A2A_URL="http://<operator-supplied-host>:<port>"  # ask the operator -- see above
 
 # Windows PowerShell
 $env:ZUGABOT_A2A_TOKEN = "friend-pc:<your-secret>"
-$env:ZUGABOT_A2A_URL   = "https://zugabot.ai"
+$env:ZUGABOT_A2A_URL   = "http://<operator-supplied-host>:<port>"
 ```
+
+`ZUGABOT_A2A_URL` code-defaults to `https://zugabot.ai` if unset, but that
+default does not currently resolve to a working A2A endpoint (see above) —
+treat the env var as required, not optional, until the operator's Zugabot
+is reachable at that public URL.
 
 ## Smoke test (before wiring into Claude Code)
 
 ```bash
 python - <<'EOF'
 import os, httpx
-url = os.environ.get("ZUGABOT_A2A_URL", "https://zugabot.ai") + "/.well-known/agent.json"
+url = os.environ["ZUGABOT_A2A_URL"] + "/.well-known/agent.json"
 print(httpx.get(url).json()["name"])   # expected output: Zugabot
 EOF
 ```
 
-If you see `Zugabot`, the endpoint is reachable. If not, check your URL and
-that the operator has deployed.
+If you see `Zugabot`, the endpoint is reachable. If you get a JSON decode
+error, `ZUGABOT_A2A_URL` is pointed at something that isn't the A2A
+endpoint (most likely `https://zugabot.ai` — that's the product frontend,
+not this).
 
 ## Register with Claude Code
 
@@ -85,7 +98,7 @@ Example Claude Code prompts once wired:
 
 ```
 > use list_zugabot_skills to see what zugabot can do
-> use delegate_to_zugabot with skill="run_zug_command" and prompt="memory.query topic:overlay"
+> use delegate_to_zugabot with skill="review_queue" and prompt="what's pending"
 ```
 
 ## Troubleshooting

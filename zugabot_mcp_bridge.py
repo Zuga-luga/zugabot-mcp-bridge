@@ -43,6 +43,22 @@ HEADERS = {
 mcp = FastMCP("zugabot-bridge")
 
 
+def _parse_json_or_raise(r: httpx.Response, what: str) -> Any:
+    """r.json() with a clear error instead of a bare JSONDecodeError -- a
+    wrong ZUGABOT_A2A_URL (e.g. a product frontend that 200s with an HTML
+    shell instead of the A2A endpoint) fails silently otherwise."""
+    try:
+        return r.json()
+    except ValueError:
+        snippet = r.text[:120].replace("\n", " ")
+        raise RuntimeError(
+            f"{what} at {r.request.url} returned non-JSON (content-type="
+            f"{r.headers.get('content-type', '?')}): {snippet!r}... "
+            f"Check ZUGABOT_A2A_URL points at an actual Zugabot A2A endpoint, "
+            f"not a web frontend."
+        ) from None
+
+
 async def _a2a_rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
     """POST one JSON-RPC call and return the parsed result. Raises on RPC error."""
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -51,7 +67,7 @@ async def _a2a_rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
     if r.status_code == 401:
         raise RuntimeError("Zugabot auth rejected — check ZUGABOT_A2A_TOKEN")
     r.raise_for_status()
-    body = r.json()
+    body = _parse_json_or_raise(r, "A2A endpoint")
     if body.get("error"):
         e = body["error"]
         raise RuntimeError(f"A2A error {e['code']}: {e['message']}")
@@ -98,7 +114,7 @@ async def list_zugabot_skills() -> str:
     async with httpx.AsyncClient(timeout=30.0) as http:
         r = await http.get(f"{A2A_URL}/.well-known/agent.json")
     r.raise_for_status()
-    card = r.json()
+    card = _parse_json_or_raise(r, "Agent Card")
     lines = [f"# {card.get('name', 'Zugabot')} v{card.get('version', '?')}", ""]
     for s in card.get("skills", []):
         lines.append(f"- **{s['id']}** — {s.get('description', '')}")
