@@ -1,2 +1,13 @@
-mcp>=1.0.0
-httpx>=0.28.0
+# Pinned exactly, deliberately.
+#
+# A sibling server in this same tree (agentpool-mcp) previously shipped
+# floating `>=` deps, pulled an incompatible combination on a fresh install,
+# and segfaulted/hung on boot in a zero-log crash loop. An MCP server that
+# dies during startup is close to invisible: the client just shows the server
+# as failed, with no traceback anywhere the caller will look.
+#
+# These are the versions this bridge is verified against (2026-08-28, tests
+# green under Python 3.11.9). Bump them deliberately, re-run tests/, and
+# commit the new pins -- do not relax them back to ranges.
+mcp==1.27.2
+httpx==0.28.1

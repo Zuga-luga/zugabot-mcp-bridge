@@ -17,6 +17,7 @@ Register with Claude Code:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from typing import Any
@@ -25,7 +26,15 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 
-A2A_URL = os.environ.get("ZUGABOT_A2A_URL", "https://zugabot.ai").rstrip("/")
+DEFAULT_A2A_URL = "https://zugabot.ai"
+
+# How long to wait on each call. A2A skills can be genuinely slow (a queued
+# render is minutes), the Agent Card is a static document.
+A2A_TIMEOUT_S = 300.0
+CARD_TIMEOUT_S = 30.0
+
+_raw_url = os.environ.get("ZUGABOT_A2A_URL", "").strip()
+A2A_URL = (_raw_url or DEFAULT_A2A_URL).rstrip("/")
 A2A_TOKEN = os.environ.get("ZUGABOT_A2A_TOKEN", "").strip()
 
 if not A2A_TOKEN:
@@ -34,6 +43,33 @@ if not A2A_TOKEN:
         file=sys.stderr,
     )
     sys.exit(2)
+
+# The token is read from the environment, so an unexpanded `${VAR}` placeholder
+# (e.g. copied verbatim out of an .mcp.json env block that was never
+# substituted) arrives here as a literal string and produces a 401 on the first
+# delegate call -- while `list_zugabot_skills` keeps working, because the Agent
+# Card is unauthenticated. That asymmetry is confusing enough to be worth
+# naming at startup rather than leaving to be discovered mid-task.
+TOKEN_IS_PLACEHOLDER = A2A_TOKEN.startswith("${") and A2A_TOKEN.endswith("}")
+if TOKEN_IS_PLACEHOLDER:
+    # Warn, do NOT exit: the Agent Card is unauthenticated, so
+    # `list_zugabot_skills` still works and is still worth serving. Only the
+    # authenticated delegate path is doomed, and it says so when called.
+    print(
+        f"WARNING: ZUGABOT_A2A_TOKEN is the literal placeholder {A2A_TOKEN!r} -- the\n"
+        "variable was never substituted, so every delegate_to_zugabot call will 401.\n"
+        "Export the real value in the environment that launches this bridge.\n"
+        "list_zugabot_skills will still work (the Agent Card is unauthenticated).",
+        file=sys.stderr,
+    )
+
+if not _raw_url:
+    print(
+        f"WARNING: ZUGABOT_A2A_URL is unset, falling back to {DEFAULT_A2A_URL}, "
+        "which serves the product\nfrontend (HTML), not the A2A endpoint. Set it "
+        "to the host actually running the Zugabot\ndaemon, e.g. http://<host>:8000.",
+        file=sys.stderr,
+    )
 
 HEADERS = {
     "Authorization": f"Bearer {A2A_TOKEN}",
@@ -62,15 +98,58 @@ def _parse_json_or_raise(r: httpx.Response, what: str) -> Any:
 async def _a2a_rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
     """POST one JSON-RPC call and return the parsed result. Raises on RPC error."""
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    async with httpx.AsyncClient(timeout=300.0) as http:
-        r = await http.post(f"{A2A_URL}/a2a", json=payload, headers=HEADERS)
+    try:
+        async with httpx.AsyncClient(timeout=A2A_TIMEOUT_S) as http:
+            r = await http.post(f"{A2A_URL}/a2a", json=payload, headers=HEADERS)
+    except httpx.TimeoutException:
+        raise RuntimeError(
+            f"Zugabot did not answer within {A2A_TIMEOUT_S:.0f}s at {A2A_URL}/a2a. "
+            "The skill may still be running on the server — check its queue "
+            "before re-sending, so the work is not done twice."
+        ) from None
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            f"Cannot reach Zugabot at {A2A_URL}/a2a ({type(exc).__name__}). "
+            "Check ZUGABOT_A2A_URL and that the Zugabot backend is running."
+        ) from None
+
     if r.status_code == 401:
+        if TOKEN_IS_PLACEHOLDER:
+            raise RuntimeError(
+                "Zugabot auth rejected — ZUGABOT_A2A_TOKEN is the unexpanded "
+                f"placeholder {A2A_TOKEN!r}, not a real credential. Export the "
+                "real value in the environment that launches this bridge; "
+                "list_zugabot_skills works without it because the Agent Card "
+                "is unauthenticated, which is why this failure looks selective."
+            )
         raise RuntimeError("Zugabot auth rejected — check ZUGABOT_A2A_TOKEN")
-    r.raise_for_status()
+    if r.status_code >= 400:
+        raise RuntimeError(
+            f"A2A endpoint returned HTTP {r.status_code} for {A2A_URL}/a2a: "
+            f"{r.text[:200]!r}"
+        )
+
     body = _parse_json_or_raise(r, "A2A endpoint")
+    if not isinstance(body, dict):
+        raise RuntimeError(
+            f"A2A endpoint returned {type(body).__name__}, expected a JSON-RPC object: "
+            f"{str(body)[:200]!r}"
+        )
     if body.get("error"):
-        e = body["error"]
-        raise RuntimeError(f"A2A error {e['code']}: {e['message']}")
+        # A malformed error object must not turn into a bare KeyError -- that
+        # hides the real server-side problem behind an unrelated crash.
+        err = body["error"]
+        if isinstance(err, dict):
+            code = err.get("code", "?")
+            message = err.get("message") or json.dumps(err)[:200]
+        else:
+            code, message = "?", str(err)[:200]
+        raise RuntimeError(f"A2A error {code}: {message}")
+    if "result" not in body:
+        raise RuntimeError(
+            "A2A response contained neither 'error' nor 'result' — the endpoint "
+            f"is not speaking JSON-RPC 2.0: {json.dumps(body)[:200]}"
+        )
     return body["result"]
 
 
@@ -111,13 +190,40 @@ async def delegate_to_zugabot(skill: str, prompt: str) -> str:
 @mcp.tool()
 async def list_zugabot_skills() -> str:
     """Fetch Zugabot's Agent Card and return the available skills as markdown."""
-    async with httpx.AsyncClient(timeout=30.0) as http:
-        r = await http.get(f"{A2A_URL}/.well-known/agent.json")
-    r.raise_for_status()
+    url = f"{A2A_URL}/.well-known/agent.json"
+    try:
+        async with httpx.AsyncClient(timeout=CARD_TIMEOUT_S) as http:
+            r = await http.get(url)
+    except httpx.TimeoutException:
+        raise RuntimeError(
+            f"Agent Card fetch timed out after {CARD_TIMEOUT_S:.0f}s at {url}."
+        ) from None
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            f"Cannot reach Zugabot at {url} ({type(exc).__name__}). Check "
+            "ZUGABOT_A2A_URL and that the Zugabot backend is running."
+        ) from None
+
+    if r.status_code >= 400:
+        raise RuntimeError(
+            f"Agent Card fetch returned HTTP {r.status_code} for {url}: {r.text[:200]!r}"
+        )
+
     card = _parse_json_or_raise(r, "Agent Card")
+    if not isinstance(card, dict):
+        raise RuntimeError(
+            f"Agent Card was {type(card).__name__}, expected an object: {str(card)[:200]!r}"
+        )
     lines = [f"# {card.get('name', 'Zugabot')} v{card.get('version', '?')}", ""]
-    for s in card.get("skills", []):
-        lines.append(f"- **{s['id']}** — {s.get('description', '')}")
+    for s in card.get("skills", []) or []:
+        if not isinstance(s, dict):
+            continue
+        # A skill entry with no id is unusable but must not crash the listing --
+        # the other skills are still worth returning.
+        skill_id = s.get("id")
+        if not skill_id:
+            continue
+        lines.append(f"- **{skill_id}** — {s.get('description', '')}")
     return "\n".join(lines)
 
 
