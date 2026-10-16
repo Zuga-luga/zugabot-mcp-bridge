@@ -227,5 +227,45 @@ async def list_zugabot_skills() -> str:
     return "\n".join(lines)
 
 
+async def _library_get(route: str, params: dict[str, Any]) -> Any:
+    """GET one /api/library route on the Zugabot backend (same host and token as A2A)."""
+    url = f"{A2A_URL}/api/library/{route}"
+    try:
+        async with httpx.AsyncClient(timeout=CARD_TIMEOUT_S) as http:
+            r = await http.get(url, params=params, headers=HEADERS)
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            f"Cannot reach the Library at {url} ({type(exc).__name__}). Check "
+            "ZUGABOT_A2A_URL and that the Zugabot backend is running."
+        ) from None
+    if r.status_code == 401:
+        raise RuntimeError("Library auth rejected — check ZUGABOT_A2A_TOKEN")
+    if r.status_code >= 400:
+        raise RuntimeError(f"Library returned HTTP {r.status_code} for {url}: {r.text[:200]!r}")
+    return _parse_json_or_raise(r, "Library")
+
+
+@mcp.tool()
+async def library_ask(question: str, k: int = 5) -> str:
+    """Ask Zugabot's Library (his Obsidian vault) a question by meaning.
+
+    Returns the top notes, best first, each with its vault path so the answer
+    can be cited. Same search chat and zugamind use.
+    """
+    return json.dumps(await _library_get("ask", {"q": question, "k": k}), indent=2)
+
+
+@mcp.tool()
+async def library_grep(pattern: str, glob: str = "**/*.md") -> str:
+    """Regex search over every vault note, logs included. Returns path, line, text."""
+    return json.dumps(await _library_get("grep", {"pattern": pattern, "glob": glob}), indent=2)
+
+
+@mcp.tool()
+async def library_find(glob: str) -> str:
+    """List vault-relative note paths matching a glob, e.g. ``Atlas/*.md``."""
+    return json.dumps(await _library_get("find", {"glob": glob}), indent=2)
+
+
 if __name__ == "__main__":
     mcp.run()
